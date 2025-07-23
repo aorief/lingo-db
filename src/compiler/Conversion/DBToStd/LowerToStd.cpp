@@ -908,6 +908,11 @@ class CastOpLowering : public OpConversionPattern<db::CastOp> {
             rewriter.replaceOp(op, value);
             return success();
          }
+      } else if (db::RuntimeFunction::dateLike(scalarSourceType) &&
+          db::RuntimeFunction::dateLike(scalarTargetType)) {
+         // In the lower IRs, both are represented as 64-bit integers with nanoseconds as units
+         rewriter.replaceOp(op, value);
+         return success();
       }
       return failure();
    }
