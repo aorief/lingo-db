@@ -29,6 +29,8 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 
+#include <llvm/ADT/TypeSwitch.h>
+
 using namespace mlir;
 
 namespace {
@@ -180,7 +182,20 @@ class AppendArrowLowering : public OpConversionPattern<db::AppendArrowOp> {
          }
          rewriter.create<lingodb::compiler::dialect::arrow::AppendFixedSizedOp>(loc, builder, value, valid);
       } else if (auto dateType = mlir::dyn_cast_or_null<db::DateType>(baseType)) {
-         size_t multiplier = dateType.getUnit() == db::DateUnitAttr::day ? 86400000000000 : 1000000;
+         size_t multiplier = 1;
+         switch (dateType.getUnit()) {
+            case db::DateUnitAttr::day: {
+               multiplier = 86400000000000;
+               break;
+            }
+            case db::DateUnitAttr::millisecond: {
+               multiplier = 100000000;
+               break;
+            }
+            default: {
+               return failure();
+            }
+         }
          mlir::Value multiplierConst = rewriter.create<mlir::arith::ConstantIntOp>(loc, multiplier, 64);
          value = rewriter.create<mlir::arith::DivSIOp>(loc, value, multiplierConst);
          if (dateType.getUnit() == db::DateUnitAttr::day) {
@@ -189,12 +204,26 @@ class AppendArrowLowering : public OpConversionPattern<db::AppendArrowOp> {
          rewriter.create<lingodb::compiler::dialect::arrow::AppendFixedSizedOp>(loc, builder, value, valid);
       } else if (auto timestampType = mlir::dyn_cast_or_null<db::TimestampType>(baseType)) {
          size_t multiplier = 1;
-         if (timestampType.getUnit() == db::TimeUnitAttr::second) {
-            multiplier = 1000000000;
-         } else if (timestampType.getUnit() == db::TimeUnitAttr::millisecond) {
-            multiplier = 1000000;
-         } else if (timestampType.getUnit() == db::TimeUnitAttr::microsecond) {
-            multiplier = 1000;
+         switch (timestampType.getUnit()) {
+            case db::TimeUnitAttr::second: {
+               multiplier = 100000000;
+               break;
+            }
+            case db::TimeUnitAttr::millisecond: {
+               multiplier = 1000000;
+               break;
+            }
+            case db::TimeUnitAttr::microsecond: {
+               multiplier = 1000;
+               break;
+            }
+            case db::TimeUnitAttr::nanosecond: {
+               multiplier = 1;
+               break;
+            }
+            default: {
+               return failure();
+            }
          }
          mlir::Value multiplierConst = rewriter.create<mlir::arith::ConstantIntOp>(loc, multiplier, 64);
          value = rewriter.create<mlir::arith::DivSIOp>(loc, value, multiplierConst);
@@ -224,68 +253,94 @@ class StringCastOpLowering : public OpConversionPattern<db::CastOp> {
       auto scalarSourceType = castOp.getVal().getType();
       auto scalarTargetType = castOp.getType();
       auto convertedTargetType = typeConverter->convertType(scalarTargetType);
-      if (!mlir::isa<db::StringType>(scalarSourceType) && !mlir::isa<db::StringType>(scalarTargetType)) return failure();
 
       Value valueToCast = adaptor.getVal();
       Value result;
       if (scalarSourceType == scalarTargetType) {
          //nothing to do here
-      } else if (auto stringType = mlir::dyn_cast_or_null<db::StringType>(scalarSourceType)) {
+      }
+      // Converting from string
+      else if (auto stringType = mlir::dyn_cast_or_null<db::StringType>(scalarSourceType)) {
          if (auto intWidth = getIntegerWidth(scalarTargetType, false)) {
             result = StringRuntime::toInt(rewriter, loc)({valueToCast})[0];
             if (intWidth < 64) {
                result = rewriter.create<arith::TruncIOp>(loc, convertedTargetType, result);
             }
-         } else if (auto floatType = mlir::dyn_cast_or_null<FloatType>(scalarTargetType)) {
-            result = floatType.getWidth() == 32 ? StringRuntime::toFloat32(rewriter, loc)({valueToCast})[0] : StringRuntime::toFloat64(rewriter, loc)({valueToCast})[0];
-         } else if (auto decimalType = mlir::dyn_cast_or_null<db::DecimalType>(scalarTargetType)) {
-            auto scale = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(decimalType.getS()));
-            result = StringRuntime::toDecimal(rewriter, loc)({valueToCast, scale})[0];
-            if (mlir::cast<mlir::IntegerType>(typeConverter->convertType(decimalType)).getWidth() < 128) {
-               auto converted = rewriter.create<arith::TruncIOp>(loc, typeConverter->convertType(decimalType), result);
-               result = converted;
-            }
-         } else if (mlir::isa<db::DateType>(scalarTargetType)) {
-            result = StringRuntime::toDate(rewriter, loc)({valueToCast})[0];
-         } else if (mlir::isa<db::TimestampType>(scalarTargetType)) {
-            result = StringRuntime::toTimestamp(rewriter, loc)({valueToCast})[0];
-         } else if (auto charType = mlir::dyn_cast_or_null<db::CharType>(scalarTargetType)) {
-            // chars with length 1 are stored as i32 and must converted, all other chars are already stored as strings
-            if (charType.getLen() <= 1) {
-               result = StringRuntime::toChar(rewriter, loc)({valueToCast})[0];
-            } else {
-               result = valueToCast;
-            }
-         } else {
-            return failure();
+         } else { // go over the possible types
+            result = mlir::TypeSwitch<Type, Value>(scalarTargetType)
+                        .Case<FloatType>([&](FloatType floatType) {
+                           return floatType.getWidth() == 32 ? StringRuntime::toFloat32(rewriter, loc)({valueToCast})[0] : StringRuntime::toFloat64(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Case<db::DecimalType>([&](db::DecimalType decimalType) {
+                           auto scale = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(decimalType.getS()));
+                           result = StringRuntime::toDecimal(rewriter, loc)({valueToCast, scale})[0];
+                           if (mlir::cast<mlir::IntegerType>(typeConverter->convertType(decimalType)).getWidth() < 128) {
+                              auto converted = rewriter.create<arith::TruncIOp>(loc, typeConverter->convertType(decimalType), result);
+                              result = converted;
+                           }
+                           return result;
+                        })
+                        .Case<db::CharType>([&](db::CharType charType) {
+                           // chars with length 1 are stored as i32 and must converted, all other chars are already stored as strings
+                           if (charType.getLen() <= 1) {
+                              result = StringRuntime::toChar(rewriter, loc)({valueToCast})[0];
+                           } else {
+                              result = valueToCast;
+                           }
+                           return result;
+                        })
+                        .Case<db::DateType>([&](db::DateType dateType) {
+                           return StringRuntime::toDate(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Case<db::TimestampType>([&](db::TimestampType timestampType) {
+                           return StringRuntime::toTimestamp(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Default([&](Type) {
+                           return Value();
+                        });
          }
-      } else if (scalarSourceType.isInteger(1)) {
-         result = StringRuntime::fromBool(rewriter, loc)({valueToCast})[0];
-      } else if (getIntegerWidth(scalarSourceType, false)) {
-         result = StringRuntime::fromInt(rewriter, loc)({valueToCast})[0];
-      } else if (auto floatType = mlir::dyn_cast_or_null<FloatType>(scalarSourceType)) {
-         result = floatType.getWidth() == 32 ? StringRuntime::fromFloat32(rewriter, loc)({valueToCast})[0] : StringRuntime::fromFloat64(rewriter, loc)({valueToCast})[0];
-      } else if (auto decimalSourceType = mlir::dyn_cast_or_null<db::DecimalType>(scalarSourceType)) {
-         auto scale = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(decimalSourceType.getS()));
-         result = StringRuntime::fromDecimal(rewriter, loc)({valueToCast, scale})[0];
-      } else if (auto charType = mlir::dyn_cast_or_null<db::CharType>(scalarSourceType)) {
-         // chars with length 1 are stored as i32 and must converted, all other chars are already stored as strings
-         if (charType.getLen() <= 1) {
-            result = StringRuntime::fromChar(rewriter, loc)({valueToCast})[0];
-         } else {
-            result = valueToCast;
-         }
-      } else if (mlir::isa<db::DateType>(scalarSourceType)) {
-         result = StringRuntime::fromDate(rewriter, loc)({valueToCast})[0];
-      } else if (mlir::isa<db::TimestampType>(scalarSourceType)) {
-         result = StringRuntime::fromTimestamp(rewriter, loc)({valueToCast})[0];
       }
+      // Convert to String
+      else if (mlir::isa<db::StringType>(scalarTargetType)) {
+         if (scalarSourceType.isInteger(1)) {
+            result = StringRuntime::fromBool(rewriter, loc)({valueToCast})[0];
+         } else if (getIntegerWidth(scalarSourceType, false)) {
+            result = StringRuntime::fromInt(rewriter, loc)({valueToCast})[0];
+         } else { // go over the possible types
+            result = mlir::TypeSwitch<Type, Value>(scalarSourceType)
+                        .Case<FloatType>([&](FloatType floatType) {
+                           return floatType.getWidth() == 32 ? StringRuntime::fromFloat32(rewriter, loc)({valueToCast})[0] : StringRuntime::fromFloat64(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Case<db::DecimalType>([&](db::DecimalType decimalSourceType) {
+                           auto scale = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(decimalSourceType.getS()));
+                           return StringRuntime::fromDecimal(rewriter, loc)({valueToCast, scale})[0];
+                        })
+                        .Case<db::CharType>([&](db::CharType charType) {
+                           // chars with length 1 are stored as i32 and must be converted, all other chars are already stored as strings
+                           if (charType.getLen() <= 1) {
+                              result = StringRuntime::fromChar(rewriter, loc)({valueToCast})[0];
+                           } else {
+                              result = valueToCast;
+                           }
+                           return result;
+                        })
+                        .Case<db::DateType>([&](db::DateType dateType) {
+                           return StringRuntime::fromDate(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Case<db::TimestampType>([&](db::TimestampType timestampType) {
+                           return StringRuntime::fromTimestamp(rewriter, loc)({valueToCast})[0];
+                        })
+                        .Default([&](Type) {
+                           return Value();
+                        });
+         }
+      }
+
       if (result) {
          rewriter.replaceOp(castOp, result);
          return success();
-      } else {
-         return failure();
       }
+      return failure();
    }
 };
 
@@ -851,14 +906,16 @@ class CastOpLowering : public OpConversionPattern<db::CastOp> {
             value = rewriter.create<arith::SIToFPOp>(loc, convertedTargetType, value);
             rewriter.replaceOp(op, value);
             return success();
-         } else if (auto decimalTargetType = mlir::dyn_cast_or_null<db::DecimalType>(scalarTargetType)) {
+         }
+         if (auto decimalTargetType = mlir::dyn_cast_or_null<db::DecimalType>(scalarTargetType)) {
             int decimalWidth = mlir::cast<mlir::IntegerType>(typeConverter->convertType(decimalTargetType)).getWidth();
             if (sourceIntWidth < decimalWidth) {
                value = rewriter.create<arith::ExtSIOp>(loc, convertedTargetType, value);
             }
             rewriter.replaceOpWithNewOp<arith::MulIOp>(op, convertedTargetType, value, getDecimalScaleMultiplierConstant(rewriter, decimalTargetType.getS(), convertedTargetType, op->getLoc()));
             return success();
-         } else if (auto targetIntWidth = getIntegerWidth(scalarTargetType, false)) {
+         }
+         if (auto targetIntWidth = getIntegerWidth(scalarTargetType, false)) {
             if (targetIntWidth < sourceIntWidth) {
                rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, convertedTargetType, value);
             } else {
@@ -870,7 +927,8 @@ class CastOpLowering : public OpConversionPattern<db::CastOp> {
          if (getIntegerWidth(scalarTargetType, false)) {
             value = rewriter.replaceOpWithNewOp<arith::FPToSIOp>(op, convertedTargetType, value);
             return success();
-         } else if (auto decimalTargetType = mlir::dyn_cast_or_null<db::DecimalType>(scalarTargetType)) {
+         }
+         if (auto decimalTargetType = mlir::dyn_cast_or_null<db::DecimalType>(scalarTargetType)) {
             auto multiplier = rewriter.create<arith::ConstantOp>(loc, convertedSourceType, FloatAttr::get(convertedSourceType, powf(10, decimalTargetType.getS())));
             value = rewriter.create<arith::MulFOp>(loc, convertedSourceType, value, multiplier);
             rewriter.replaceOpWithNewOp<arith::FPToSIOp>(op, convertedTargetType, value);
@@ -893,12 +951,14 @@ class CastOpLowering : public OpConversionPattern<db::CastOp> {
                rewriter.replaceOpWithNewOp<arith::DivSIOp>(op, convertedTargetType, value, multiplier);
             }
             return success();
-         } else if (mlir::isa<FloatType>(scalarTargetType)) {
+         }
+         if (mlir::isa<FloatType>(scalarTargetType)) {
             auto multiplier = rewriter.create<arith::ConstantOp>(loc, convertedTargetType, FloatAttr::get(convertedTargetType, powf(10, decimalSourceType.getS())));
             value = rewriter.create<arith::SIToFPOp>(loc, convertedTargetType, value);
             rewriter.replaceOpWithNewOp<arith::DivFOp>(op, convertedTargetType, value, multiplier);
             return success();
-         } else if (auto targetIntWidth = getIntegerWidth(scalarTargetType, false)) {
+         }
+         if (auto targetIntWidth = getIntegerWidth(scalarTargetType, false)) {
             int decimalWidth = mlir::cast<mlir::IntegerType>(convertedSourceType).getWidth();
             auto multiplier = getDecimalScaleMultiplierConstant(rewriter, decimalSourceType.getS(), convertedSourceType, op->getLoc());
             value = rewriter.create<arith::DivSIOp>(loc, convertedSourceType, value, multiplier);
